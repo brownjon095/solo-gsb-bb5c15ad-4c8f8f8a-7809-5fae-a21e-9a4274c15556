@@ -12,7 +12,7 @@
       <span class="logo">⚗️</span>
       <div>
         <h1>实验室配液相容性推演台</h1>
-        <p class="subtitle">试剂属性 · 时序加液 · 规则图逐步推演 · 危险溯源 · CSV 导入 · 方案保存 / JSON 导出</p>
+        <p class="subtitle">试剂属性 · 时序加液 · 规则图逐步推演 · 危险溯源 · 废液分桶 · CSV 导入 · 方案保存 / JSON 导出</p>
       </div>
     </div>
     <div class="rev" id="ruleRev" title="当前规则图版本">规则图版本 —</div>
@@ -20,6 +20,7 @@
 
   <nav class="tabs">
     <button class="tab active" data-tab="plans">📋 配液方案</button>
+    <button class="tab" data-tab="bucketing">🛢️ 废液分桶</button>
     <button class="tab" data-tab="reagents">🧪 试剂档案</button>
     <button class="tab" data-tab="rules">🕸️ 规则图</button>
     <button class="tab" data-tab="runs">🗂️ 推演记录</button>
@@ -83,6 +84,52 @@
       </div>
 
       <div id="reportWrap" class="hidden"></div>
+    </section>
+
+    <!-- ========== 废液分桶 ========== -->
+    <section id="tab-bucketing" class="tab-panel">
+      <div class="card">
+        <div class="card-head">
+          <h2>🛢️ 废液分桶规划</h2>
+          <span class="item-meta">复用试剂档案与当前全局启用规则 · 预览不落库</span>
+        </div>
+        <p class="hint">从试剂档案选择最多 <b>12</b> 股废液并填写各自体积：任一方向命中
+          <span class="badge badge-high">严重</span> 规则的两股废液不会分入同桶，同桶总体积不超过单桶容量。
+          系统求<b>桶数最少</b>的完整方案；桶数并列时选<b>最大桶负载最小</b>者，
+          再按<b>桶内试剂名称序列</b>确定稳定结果。单股体积超过单桶容量时会给出明确原因且不生成方案。</p>
+        <div class="form">
+          <div class="form-row">
+            <label>单桶容量 (mL)
+              <input type="number" id="bkCapacity" min="0" step="1" value="1000" />
+            </label>
+            <label>&nbsp;
+              <span class="hint" style="margin:0">容量按体积（mL）统一口径计算，固体废液可按质量（g）同口径录入。</span>
+            </label>
+          </div>
+          <div class="card-head">
+            <h3>废液清单（已选 <span id="bkCount">0</span>/12 股）</h3>
+            <button type="button" class="btn btn-small" id="btnBkAdd">＋ 添加废液</button>
+          </div>
+          <div class="table-wrap">
+            <table class="grid" id="bkTable">
+              <thead>
+                <tr>
+                  <th style="width:42px">#</th>
+                  <th>废液（来自试剂档案）</th>
+                  <th style="width:140px">体积 (mL)</th>
+                  <th style="width:42px"></th>
+                </tr>
+              </thead>
+              <tbody id="bkBody"></tbody>
+            </table>
+          </div>
+          <div class="form-actions">
+            <button type="button" class="btn btn-primary" id="btnBkSolve">🧮 计算分桶方案（预览）</button>
+            <button type="button" class="btn btn-ghost" id="btnBkReset">清空</button>
+          </div>
+        </div>
+      </div>
+      <div id="bkResult"></div>
     </section>
 
     <!-- ========== 试剂 ========== -->

@@ -661,5 +661,153 @@ check("序号重复标出全部相关行", rows == {2, 3}, e["detail"]["errors"]
 
 call("DELETE", f"/api/plans/{impid}")
 
+# ---------- 12. 废液分桶规划（预览不落库 · 最少桶 · 稳定结果 · 超容量拒绝） ----------
+print("【场景12】废液分桶规划")
+s, runs_before_bk = call("GET", "/api/runs")
+s, plans_before_bk = call("GET", "/api/plans")
+
+def mk_bk_reagent(name, cats):
+    s, r = call("POST", "/api/reagents", {"name": name, "categories": cats})
+    assert s == 201, (s, r)
+    return r["id"]
+
+bkA = mk_bk_reagent("测试废液A", ["cyanide"])
+bkB = mk_bk_reagent("测试废液B", ["strong_acid"])
+bkC = mk_bk_reagent("测试废液C", ["halide_salt"])
+bkD = mk_bk_reagent("测试废液D", [])
+bkE = mk_bk_reagent("测试废液E", [])
+
+# A×B 在任一方向命中 R001（high）→ 不可同桶；容量 700 下最少 2 桶
+bk_req = {"capacity_ml": 700, "streams": [
+    {"reagent_id": bkA, "volume_ml": 100},
+    {"reagent_id": bkB, "volume_ml": 100},
+    {"reagent_id": bkC, "volume_ml": 500},
+]}
+s, r = call("POST", "/api/bucketing/preview", bk_req)
+check("分桶预览 200", s == 200, (s, r))
+check("最少桶数=2", r["barrel_count"] == 2, r.get("barrel_count"))
+check("最大桶负载最小=600", r["max_load_ml"] == 600, r.get("max_load_ml"))
+bk_names = [[it["name"] for it in b["items"]] for b in r["barrels"]]
+check("桶内名称序列稳定", bk_names == [["测试废液A"], ["测试废液B", "测试废液C"]], bk_names)
+check("每桶带负载与组成", all(b["load_ml"] > 0 and 0 < b["utilization"] <= 1
+      and b["items"] for b in r["barrels"]), r["barrels"])
+check("分隔约束 1 对", len(r["separations"]) == 1, r["separations"])
+sep0 = r["separations"][0]
+check("分隔对为 A×B", {sep0["stream_a"]["name"], sep0["stream_b"]["name"]}
+      == {"测试废液A", "测试废液B"}, sep0)
+check("分隔依据含 R001 与类别对", any(x["rule_id"] == "R001"
+      and x["category_a"] == "cyanide" and x["category_b"] == "strong_acid"
+      for x in sep0["rules"]), sep0)
+check("分隔依据含方程式/机理/文献", any("HCN" in x["reaction"] and len(x["rationale"]) > 20
+      and x["references"] for x in sep0["rules"]), sep0)
+check("预览带全局规则版本号", bool(r["rule_revision"]), r.get("rule_revision"))
+
+# 结果可复现：同一请求再算一次完全一致
+s, r2 = call("POST", "/api/bucketing/preview", bk_req)
+check("同输入结果稳定一致", s == 200 and r2 == r)
+
+# 容量约束：C/D/E 各 600、容量 1000 → 3 桶（无 high 冲突）
+s, r = call("POST", "/api/bucketing/preview", {"capacity_ml": 1000, "streams": [
+    {"reagent_id": bkC, "volume_ml": 600},
+    {"reagent_id": bkD, "volume_ml": 600},
+    {"reagent_id": bkE, "volume_ml": 600},
+]})
+check("体积约束 3 桶", s == 200 and r["barrel_count"] == 3
+      and r["max_load_ml"] == 600, (s, r.get("barrel_count")))
+check("无冲突对时分隔列表为空", r["separations"] == [])
+
+# 同桶数并列时先比最大负载：100/100/150、容量 200 → {C,D}|{E}（最大负载 200）
+s, r = call("POST", "/api/bucketing/preview", {"capacity_ml": 200, "streams": [
+    {"reagent_id": bkC, "volume_ml": 100},
+    {"reagent_id": bkD, "volume_ml": 100},
+    {"reagent_id": bkE, "volume_ml": 150},
+]})
+bk_names = [[it["name"] for it in b["items"]] for b in r["barrels"]]
+check("最大负载最小优先", s == 200 and r["barrel_count"] == 2
+      and r["max_load_ml"] == 200
+      and bk_names == [["测试废液C", "测试废液D"], ["测试废液E"]], (r.get("max_load_ml"), bk_names))
+
+# 最大负载仍并列时按名称序列：100/100/100、容量 200 → {D,E}|{C}
+s, r = call("POST", "/api/bucketing/preview", {"capacity_ml": 200, "streams": [
+    {"reagent_id": bkC, "volume_ml": 100},
+    {"reagent_id": bkD, "volume_ml": 100},
+    {"reagent_id": bkE, "volume_ml": 100},
+]})
+bk_names = [[it["name"] for it in b["items"]] for b in r["barrels"]]
+check("名称序列 tie-break", s == 200 and r["max_load_ml"] == 200
+      and bk_names == [["测试废液C"], ["测试废液D", "测试废液E"]], bk_names)
+
+# medium 规则不构成分隔：B(强酸) + 氢氧化钠溶液(强碱) 仅命中 R014(medium) → 可同桶
+s, all_reagents = call("GET", "/api/reagents")
+naoh = next(x for x in all_reagents if x["name"] == "氢氧化钠溶液")
+s, r = call("POST", "/api/bucketing/preview", {"capacity_ml": 1000, "streams": [
+    {"reagent_id": bkB, "volume_ml": 100},
+    {"reagent_id": naoh["id"], "volume_ml": 100},
+]})
+check("medium 规则不分隔（可同桶）", s == 200 and r["barrel_count"] == 1
+      and r["separations"] == [], (s, r.get("barrel_count")))
+
+# 有向 high 规则：任一方向命中即分隔
+s, _ = call("POST", "/api/rules", {
+    "id": "C301", "source": "bk_cat_p", "target": "bk_cat_q",
+    "directional": True, "severity": "high", "title": "有向分桶测试规则",
+    "reaction": "P + Q -> 危险", "rationale": "分桶方向性测试", "references": ["测试文献"],
+})
+check("创建有向测试规则", s == 201, s)
+bkP = mk_bk_reagent("测试废液P", ["bk_cat_p"])
+bkQ = mk_bk_reagent("测试废液Q", ["bk_cat_q"])
+s, r = call("POST", "/api/bucketing/preview", {"capacity_ml": 1000, "streams": [
+    {"reagent_id": bkP, "volume_ml": 100},
+    {"reagent_id": bkQ, "volume_ml": 100},
+]})
+check("有向 high 规则任一方向命中即分隔", s == 200 and r["barrel_count"] == 2,
+      (s, r.get("barrel_count")))
+check("分隔依据标记有向规则", r["separations"][0]["rules"][0]["directional"] is True
+      and r["separations"][0]["rules"][0]["rule_id"] == "C301", r["separations"])
+call("DELETE", "/api/rules/C301")
+
+# 单股超容量 → 422 + 明确原因，不生成部分方案
+s, e = call("POST", "/api/bucketing/preview", {"capacity_ml": 100, "streams": [
+    {"reagent_id": bkA, "volume_ml": 150},
+    {"reagent_id": bkB, "volume_ml": 50},
+]})
+check("单股超容量 422", s == 422, (s, e))
+bk_detail = e.get("detail", {}) if isinstance(e, dict) else {}
+check("原因指明超容量废液与容量", "测试废液A" in bk_detail.get("message", "")
+      and "100" in bk_detail.get("message", ""), bk_detail)
+check("不生成部分方案", "barrels" not in e
+      and bk_detail.get("oversized", [{}])[0].get("name") == "测试废液A", e)
+
+# 请求校验：重复试剂 / 不存在试剂 / 非法数值 / 超 12 股
+s, e = call("POST", "/api/bucketing/preview", {"capacity_ml": 1000, "streams": [
+    {"reagent_id": bkA, "volume_ml": 10}, {"reagent_id": bkA, "volume_ml": 20}]})
+check("重复试剂 422", s == 422, (s, e))
+s, e = call("POST", "/api/bucketing/preview", {"capacity_ml": 1000,
+    "streams": [{"reagent_id": 999999, "volume_ml": 10}]})
+check("试剂不存在 404", s == 404, (s, e))
+s, _ = call("POST", "/api/bucketing/preview", {"capacity_ml": 0,
+    "streams": [{"reagent_id": bkA, "volume_ml": 10}]})
+check("容量非法 422", s == 422, s)
+s, _ = call("POST", "/api/bucketing/preview", {"capacity_ml": 100,
+    "streams": [{"reagent_id": bkA, "volume_ml": 0}]})
+check("体积非法 422", s == 422, s)
+s, _ = call("POST", "/api/bucketing/preview", {"capacity_ml": 100, "streams": []})
+check("空清单 422", s == 422, s)
+s, all_reagents = call("GET", "/api/reagents")
+ids13 = [x["id"] for x in all_reagents[:13]]
+s, _ = call("POST", "/api/bucketing/preview", {"capacity_ml": 100000,
+    "streams": [{"reagent_id": i, "volume_ml": 1} for i in ids13]})
+check("超过 12 股 422", s == 422, s)
+
+# 预览不落库：不产生推演记录、不产生方案
+s, runs_after_bk = call("GET", "/api/runs")
+s, plans_after_bk = call("GET", "/api/plans")
+check("预览不落库（无新增记录/方案）", len(runs_after_bk) == len(runs_before_bk)
+      and len(plans_after_bk) == len(plans_before_bk),
+      (len(runs_after_bk), len(plans_after_bk)))
+
+for rid in (bkA, bkB, bkC, bkD, bkE, bkP, bkQ):
+    call("DELETE", f"/api/reagents/{rid}")
+
 print(f"\n结果：{PASS} 通过，{FAIL} 失败")
 sys.exit(1 if FAIL else 0)

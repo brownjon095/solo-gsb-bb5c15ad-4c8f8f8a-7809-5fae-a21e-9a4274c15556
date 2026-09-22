@@ -18,6 +18,8 @@ const state = {
   diff: null,
   ruleVersions: [],      // 当前选中方案的规则版本列表
   rvPlanId: null,        // 规则版本模块当前选中的方案 ID
+  bkRows: [],            // 废液分桶清单行
+  bkResult: null,        // 最近一次分桶预览结果
 };
 
 /* ---------------- API ---------------- */
@@ -70,6 +72,7 @@ $$(".tab").forEach((btn) => {
       setTimeout(renderGraph, 60);
     }
     if (btn.dataset.tab === "runs") loadRuns();
+    if (btn.dataset.tab === "bucketing") renderBkRows();
   });
 });
 
@@ -80,6 +83,7 @@ async function loadReagents() {
   renderReagentList();
   renderCategoryChips();
   renderStepRows();
+  renderBkRows();
 }
 
 async function loadPlans() {
@@ -735,6 +739,241 @@ function syncImportCommitBtn() {
 }
 
 $("#btnOpenImport").addEventListener("click", openImportModal);
+
+/* ---------------- 废液分桶规划 ---------------- */
+
+const BK_MAX_STREAMS = 12;
+
+function makeBkRow(partial = {}) {
+  return {
+    reagent_id: partial.reagent_id ?? null,
+    volume_ml: partial.volume_ml ?? null,
+  };
+}
+
+function renderBkRows() {
+  const body = $("#bkBody");
+  if (!body) return;
+  body.innerHTML = "";
+  state.bkRows.forEach((row, idx) => {
+    const tr = document.createElement("tr");
+
+    const tdIdx = document.createElement("td");
+    tdIdx.className = "step-idx";
+    tdIdx.textContent = idx + 1;
+    tr.appendChild(tdIdx);
+
+    // 废液：仅从试剂档案选择（类别决定 high 规则命中）
+    const tdReg = document.createElement("td");
+    const select = document.createElement("select");
+    select.innerHTML =
+      '<option value="">— 选择试剂档案 —</option>' +
+      state.reagents
+        .map((r) => `<option value="${r.id}" ${row.reagent_id === r.id ? "selected" : ""}>${escapeHtml(r.name)}</option>`)
+        .join("");
+    select.addEventListener("change", () => {
+      const rid = select.value ? Number(select.value) : null;
+      if (rid !== null && state.bkRows.some((x, k) => k !== idx && x.reagent_id === rid)) {
+        toast("该试剂已在清单中：同一试剂请合并体积后作为一股", true);
+        select.value = row.reagent_id ?? "";
+        return;
+      }
+      row.reagent_id = rid;
+      renderBkRows();
+    });
+    tdReg.appendChild(select);
+    const reg = state.reagents.find((x) => x.id === row.reagent_id);
+    if (reg && reg.categories.length) {
+      const tags = document.createElement("div");
+      tags.style.marginTop = "4px";
+      tags.innerHTML = reg.categories
+        .map((c) => `<span class="badge badge-low">${escapeHtml(catLabel(c))}</span>`)
+        .join(" ");
+      tdReg.appendChild(tags);
+    }
+    tr.appendChild(tdReg);
+
+    // 体积
+    const tdVol = document.createElement("td");
+    const inVol = document.createElement("input");
+    inVol.type = "number"; inVol.min = "0"; inVol.step = "0.1";
+    inVol.placeholder = "如 250";
+    inVol.value = row.volume_ml ?? "";
+    inVol.addEventListener("input", () => {
+      row.volume_ml = inVol.value === "" ? null : Number(inVol.value);
+    });
+    tdVol.appendChild(inVol);
+    tr.appendChild(tdVol);
+
+    // 删除
+    const tdDel = document.createElement("td");
+    const del = document.createElement("button");
+    del.type = "button"; del.className = "icon-btn"; del.textContent = "✕";
+    del.title = "移除此废液";
+    del.addEventListener("click", () => {
+      state.bkRows.splice(idx, 1);
+      renderBkRows();
+    });
+    tdDel.appendChild(del);
+    tr.appendChild(tdDel);
+
+    body.appendChild(tr);
+  });
+  $("#bkCount").textContent = state.bkRows.length;
+  $("#btnBkAdd").disabled = state.bkRows.length >= BK_MAX_STREAMS;
+}
+
+$("#btnBkAdd").addEventListener("click", () => {
+  if (state.bkRows.length >= BK_MAX_STREAMS) {
+    toast(`最多 ${BK_MAX_STREAMS} 股废液`, true);
+    return;
+  }
+  state.bkRows.push(makeBkRow());
+  renderBkRows();
+});
+
+$("#btnBkReset").addEventListener("click", () => {
+  state.bkRows = [makeBkRow()];
+  state.bkResult = null;
+  $("#bkResult").innerHTML = "";
+  renderBkRows();
+});
+
+function collectBkPayload() {
+  const capacity = Number($("#bkCapacity").value);
+  if (!(capacity > 0)) throw new Error("请填写大于 0 的单桶容量");
+  const rows = state.bkRows.filter((r) => r.reagent_id !== null || (r.volume_ml ?? 0) > 0);
+  if (!rows.length) throw new Error("请至少添加一股废液");
+  rows.forEach((r, i) => {
+    if (r.reagent_id === null) throw new Error(`第 ${i + 1} 股废液尚未选择试剂`);
+    if (!(r.volume_ml > 0)) throw new Error(`第 ${i + 1} 股废液需填写大于 0 的体积`);
+  });
+  return {
+    capacity_ml: capacity,
+    streams: rows.map((r) => ({ reagent_id: r.reagent_id, volume_ml: r.volume_ml })),
+  };
+}
+
+$("#btnBkSolve").addEventListener("click", async () => {
+  try {
+    const payload = collectBkPayload();
+    const result = await api("/api/bucketing/preview", { method: "POST", body: payload });
+    state.bkResult = result;
+    renderBkResult(result);
+    toast(`分桶完成：最少 ${result.barrel_count} 桶，最大桶负载 ${result.max_load_ml} mL`);
+  } catch (err) {
+    const detail = err.data && err.data.detail;
+    if (err.status === 422 && detail && Array.isArray(detail.oversized)) {
+      renderBkOversized(detail);  // 单股超容量：展示明确原因，不生成部分方案
+    } else {
+      toast(err.message, true);
+    }
+  }
+});
+
+function renderBkResult(result) {
+  const host = $("#bkResult");
+  host.innerHTML = `
+    <div class="report-banner safe">
+      <span class="big">🛢️</span>
+      <div style="flex:1">
+        <h2>最少需要 ${result.barrel_count} 桶 · 最大桶负载 ${result.max_load_ml} mL</h2>
+        <p class="item-meta">单桶容量 ${result.capacity_ml} mL · 共 ${result.stream_count} 股 /
+          总体积 ${result.total_volume_ml} mL · 全局启用规则图 ${escapeHtml(result.rule_revision || "-")} ·
+          预览结果不落库</p>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2>每桶组成与负载（${result.barrel_count} 桶）</h2></div>
+      <div class="bk-barrels">${result.barrels.map(renderBkBarrel).join("")}</div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2>⚠️ 分隔约束与规则依据（${result.separations.length} 对）</h2></div>
+      ${result.separations.length
+        ? `<p class="hint">以下废液对因在任一方向命中 high 级规则而不可同桶，点击查看判定依据。</p>
+           <div class="finding-list">${result.separations.map(renderBkSeparation).join("")}</div>`
+        : '<p class="hint">所选废液两两之间均未命中 high 级规则，分桶仅受容量约束。</p>'}
+    </div>`;
+  $$(".bk-sep", host).forEach((el) => {
+    el.addEventListener("click", () => {
+      const sep = result.separations[Number(el.dataset.sep)];
+      if (sep) openBkSeparationModal(sep, result.rule_revision);
+    });
+  });
+  host.scrollIntoView?.({ behavior: "smooth", block: "start" });
+}
+
+function renderBkBarrel(b) {
+  const pct = Math.min(100, Math.round(b.utilization * 100));
+  const cls = pct >= 95 ? "badge-medium" : "badge-ok";
+  return `
+    <div class="bk-barrel">
+      <div class="bk-barrel-head">
+        <span class="bk-barrel-title">桶 ${b.index}</span>
+        <span class="badge ${cls}">负载 ${b.load_ml} mL · ${pct}%</span>
+      </div>
+      <div class="bk-loadbar"><i style="width:${pct}%"></i></div>
+      <ul class="bk-items">
+        ${b.items.map((it) => `
+          <li>
+            <span class="bk-item-name">${escapeHtml(it.name)}</span>
+            <span class="item-meta">${it.volume_ml} mL</span>
+            <span class="bk-item-cats">${it.categories
+              .map((c) => `<span class="badge badge-low">${escapeHtml(catLabel(c))}</span>`)
+              .join(" ")}</span>
+          </li>`).join("")}
+      </ul>
+    </div>`;
+}
+
+function renderBkSeparation(sep, idx) {
+  return `
+    <div class="finding-card high bk-sep" data-sep="${idx}">
+      <div class="fc-title">🚫 ${escapeHtml(sep.stream_a.name)} ✕ ${escapeHtml(sep.stream_b.name)}</div>
+      <div class="fc-meta">${sep.rules
+        .map((r) => `<span class="badge badge-high">[${escapeHtml(r.rule_id)}] ${escapeHtml(r.title)}</span>`)
+        .join(" ")}</div>
+      <div class="fc-meta">点击查看促使两股分隔的规则依据</div>
+    </div>`;
+}
+
+function openBkSeparationModal(sep, revision) {
+  openModal(`
+    <button class="btn btn-ghost modal-close">✕ 关闭</button>
+    <h3>🚫 ${escapeHtml(sep.stream_a.name)} 与 ${escapeHtml(sep.stream_b.name)} 不可同桶</h3>
+    <p class="hint">以下 high 级规则在任一方向命中两股废液的类别组合
+      （当前全局启用规则图 ${escapeHtml(revision || state.revision || "-")}）。</p>
+    ${sep.rules.map((r) => `
+      <div class="m-row" style="border-top:1px solid var(--line);padding-top:10px">
+        <div class="m-k">[${escapeHtml(r.rule_id)}] ${escapeHtml(r.title)}
+          ${r.directional ? "（有向规则，任一方向命中即分隔）" : "（无向规则，双向等价）"}</div>
+        <div>类别对：<b>${escapeHtml(catLabel(r.category_a))}</b>（${escapeHtml(sep.stream_a.name)}）
+          × <b>${escapeHtml(catLabel(r.category_b))}</b>（${escapeHtml(sep.stream_b.name)}）</div>
+        <div class="m-eq" style="margin-top:4px">${escapeHtml(r.reaction)}</div>
+        <div style="margin-top:4px">${escapeHtml(r.rationale).replace(/\n/g, "<br>")}</div>
+        <ul class="m-refs">${(r.references || []).map((x) => `<li>· ${escapeHtml(x)}</li>`).join("") || "<li>无</li>"}</ul>
+      </div>`).join("")}
+  `);
+  $("#modalBox").classList.add("modal-wide");
+}
+
+function renderBkOversized(detail) {
+  const host = $("#bkResult");
+  const items = (detail.oversized || [])
+    .map((o) => `<li>「${escapeHtml(o.name)}」 ${o.volume_ml} mL ＞ 单桶容量 ${o.capacity_ml} mL</li>`)
+    .join("");
+  host.innerHTML = `
+    <div class="report-banner danger">
+      <span class="big">⛔</span>
+      <div style="flex:1">
+        <h2>无法生成分桶方案</h2>
+        <p>${escapeHtml(detail.message || "存在超过单桶容量的废液")}</p>
+        <ul class="m-refs">${items}</ul>
+        <p class="item-meta">未生成任何部分方案，请增大单桶容量或拆分该股废液后重新计算。</p>
+      </div>
+    </div>`;
+  host.scrollIntoView?.({ behavior: "smooth", block: "start" });
+}
 
 function actionBtn(text, cls, fn) {
   const b = document.createElement("button");
@@ -2257,7 +2496,9 @@ function fmtTime(iso) {
 
 (async function init() {
   state.stepRows = [makeStepRow()];
+  state.bkRows = [makeBkRow()];
   renderStepRows();
+  renderBkRows();
   renderCategoryChips();
   try {
     await Promise.all([loadReagents(), loadPlans(), loadRules()]);

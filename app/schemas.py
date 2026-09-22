@@ -215,6 +215,22 @@ class RuleVersionUpdate(BaseModel):
     rules: Optional[list[VersionRuleIn]] = None
 
 
+# ---------- 废液分桶规划 ----------
+
+class WasteStreamIn(BaseModel):
+    """一股废液：档案试剂 + 体积（mL）。"""
+
+    reagent_id: int
+    volume_ml: float = Field(gt=0, le=1_000_000)
+
+
+class BucketingPreviewIn(BaseModel):
+    """废液分桶预览：最多 12 股废液 + 单桶容量，仅演算不落库。"""
+
+    capacity_ml: float = Field(gt=0, le=10_000_000)
+    streams: list[WasteStreamIn] = Field(min_length=1, max_length=12)
+
+
 # ---------- 方案 CSV 导入 ----------
 
 class ImportPreviewIn(BaseModel):
