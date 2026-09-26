@@ -541,3 +541,54 @@ textarea { resize: vertical; }
 .import-msg-ok { background: var(--ok-bg); border: 1px solid #bbf7d0; color: var(--ok); }
 .import-row-err td { background: #fef2f2; }
 .import-unknown-confirm { display: flex; margin-top: 8px; }
+
+/* ---------- 废液分桶规划 ---------- */
+.bucket-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+.bucket-card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  background: var(--panel);
+}
+.bucket-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 8px;
+}
+.bucket-loadbar {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--line);
+  overflow: hidden;
+  margin-bottom: 8px;
+}
+.bucket-loadbar i {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, var(--brand), #0e7490);
+  border-radius: 999px;
+}
+.bucket-members {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.bucket-member {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  border-top: 1px dashed var(--line);
+  padding-top: 6px;
+}
+.bucket-member-name { font-weight: 600; }
+.bucket-sep { cursor: pointer; }

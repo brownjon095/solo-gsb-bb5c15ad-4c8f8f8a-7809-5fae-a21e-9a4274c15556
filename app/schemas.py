@@ -231,3 +231,19 @@ class PlanImportIn(BaseModel):
     csv_text: str = Field(min_length=1, max_length=200_000)
     # 存在档案外试剂时，必须显式确认（作为临时试剂写入步骤）后才允许提交
     allow_unknown_reagents: bool = False
+
+
+# ---------- 废液分桶规划 ----------
+
+class BucketStreamIn(BaseModel):
+    """一股废液：复用试剂档案（类别以档案实时为准）+ 体积。"""
+
+    reagent_id: int = Field(ge=1)
+    volume_ml: float = Field(gt=0, le=1_000_000)
+
+
+class BucketPlanPreviewIn(BaseModel):
+    """分桶预览：最多 12 股废液 + 单桶容量；不落库、不生成部分方案。"""
+
+    bucket_capacity_ml: float = Field(gt=0, le=10_000_000)
+    streams: list[BucketStreamIn] = Field(min_length=1, max_length=12)

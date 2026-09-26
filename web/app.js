@@ -80,6 +80,7 @@ async function loadReagents() {
   renderReagentList();
   renderCategoryChips();
   renderStepRows();
+  renderBucketStreams();
 }
 
 async function loadPlans() {
@@ -2235,6 +2236,236 @@ function renderRvDiffResult(d) {
     </div>`;
 }
 
+/* ---------------- 废液分桶规划 ---------------- */
+
+const MAX_BUCKET_STREAMS = 12;
+const bucketState = {
+  streams: [],   // { reagent_id, volume_ml }
+  result: null,  // 最近一次成功预览的分桶方案
+};
+
+function makeBucketStream() {
+  return { reagent_id: null, volume_ml: null };
+}
+
+function fmtMl(v) {
+  if (v === null || v === undefined) return "—";
+  const n = Number(v);
+  return Number.isInteger(n) ? String(n) : n.toFixed(3).replace(/\.?0+$/, "");
+}
+
+function renderBucketStreams() {
+  const body = $("#bucketBody");
+  if (!body) return;
+  body.innerHTML = "";
+  bucketState.streams.forEach((row, idx) => {
+    const tr = document.createElement("tr");
+
+    const tdIdx = document.createElement("td");
+    tdIdx.className = "step-idx";
+    tdIdx.textContent = idx + 1;
+    tr.appendChild(tdIdx);
+
+    const tdReg = document.createElement("td");
+    const select = document.createElement("select");
+    select.innerHTML =
+      '<option value="">— 选择试剂档案 —</option>' +
+      state.reagents
+        .map((r) => `<option value="${r.id}" ${row.reagent_id === r.id ? "selected" : ""}>${escapeHtml(r.name)}</option>`)
+        .join("");
+    select.addEventListener("change", () => {
+      row.reagent_id = select.value ? Number(select.value) : null;
+      renderBucketStreams();
+    });
+    tdReg.appendChild(select);
+    const r = state.reagents.find((x) => x.id === row.reagent_id);
+    if (r && r.categories.length) {
+      const tags = document.createElement("div");
+      tags.style.marginTop = "4px";
+      tags.innerHTML = r.categories
+        .map((c) => `<span class="badge badge-low">${escapeHtml(catLabel(c))}</span>`)
+        .join(" ");
+      tdReg.appendChild(tags);
+    }
+    tr.appendChild(tdReg);
+
+    const tdVol = document.createElement("td");
+    const inVol = document.createElement("input");
+    inVol.type = "number"; inVol.min = "0"; inVol.step = "0.1";
+    inVol.placeholder = "如 250";
+    inVol.value = row.volume_ml ?? "";
+    inVol.addEventListener("input", () => {
+      row.volume_ml = inVol.value === "" ? null : Number(inVol.value);
+    });
+    tdVol.appendChild(inVol);
+    tr.appendChild(tdVol);
+
+    const tdDel = document.createElement("td");
+    const del = document.createElement("button");
+    del.type = "button"; del.className = "icon-btn"; del.textContent = "✕";
+    del.title = "移除此废液";
+    del.addEventListener("click", () => {
+      bucketState.streams.splice(idx, 1);
+      renderBucketStreams();
+    });
+    tdDel.appendChild(del);
+    tr.appendChild(tdDel);
+
+    body.appendChild(tr);
+  });
+  const counter = $("#bucketStreamCount");
+  if (counter) counter.textContent = String(bucketState.streams.length);
+  const addBtn = $("#btnAddBucketStream");
+  if (addBtn) addBtn.disabled = bucketState.streams.length >= MAX_BUCKET_STREAMS;
+}
+
+$("#btnAddBucketStream")?.addEventListener("click", () => {
+  if (bucketState.streams.length >= MAX_BUCKET_STREAMS) {
+    toast(`最多选择 ${MAX_BUCKET_STREAMS} 股废液`, true);
+    return;
+  }
+  bucketState.streams.push(makeBucketStream());
+  renderBucketStreams();
+});
+
+$("#btnBucketReset")?.addEventListener("click", () => {
+  bucketState.streams = [makeBucketStream()];
+  bucketState.result = null;
+  $("#bucketCapacity").value = "1000";
+  renderBucketStreams();
+  $("#bucketResult").innerHTML = '<p class="hint">尚未计算。填写左侧废液清单后点击「生成分桶方案」。</p>';
+});
+
+function collectBucketPayload() {
+  const capacity = Number($("#bucketCapacity").value);
+  if (!capacity || capacity <= 0) throw new Error("请填写大于 0 的单桶容量");
+  if (!bucketState.streams.length) throw new Error("请至少添加一股废液");
+  if (bucketState.streams.length > MAX_BUCKET_STREAMS) {
+    throw new Error(`最多选择 ${MAX_BUCKET_STREAMS} 股废液`);
+  }
+  const streams = bucketState.streams.map((row, i) => {
+    if (!row.reagent_id) throw new Error(`第 ${i + 1} 股废液请选择试剂档案`);
+    if (row.volume_ml === null || !(row.volume_ml > 0)) {
+      throw new Error(`第 ${i + 1} 股废液请填写大于 0 的体积`);
+    }
+    return { reagent_id: row.reagent_id, volume_ml: row.volume_ml };
+  });
+  return { bucket_capacity_ml: capacity, streams };
+}
+
+$("#btnBucketPlan")?.addEventListener("click", async () => {
+  const host = $("#bucketResult");
+  try {
+    const payload = collectBucketPayload();
+    const plan = await api("/api/bucketing/preview", { method: "POST", body: payload });
+    bucketState.result = plan;
+    renderBucketPlan(plan);
+    toast(`分桶完成：最少 ${plan.bucket_count} 桶 · 最大负载 ${fmtMl(plan.max_bucket_load_ml)} mL`);
+  } catch (err) {
+    bucketState.result = null;
+    renderBucketError(err);
+    toast(err.message, true);
+  }
+  host.scrollIntoView?.({ behavior: "smooth", block: "start" });
+});
+
+function renderBucketError(err) {
+  const host = $("#bucketResult");
+  const detail = (err.data && err.data.detail) || {};
+  const over = detail.over_capacity_streams || [];
+  let html = `<div class="report-banner danger"><span class="big">🛑</span><div style="flex:1">
+    <h2>无法生成分桶方案</h2><p>${escapeHtml(detail.message || err.message)}</p>`;
+  if (over.length) {
+    html += `<div class="table-wrap"><table class="grid"><thead>
+      <tr><th>#</th><th>废液</th><th>体积 (mL)</th><th>单桶容量 (mL)</th></tr></thead><tbody>` +
+      over.map((s) => `<tr>
+        <td>${s.index + 1}</td><td>${escapeHtml(s.name)}</td>
+        <td>${fmtMl(s.volume_ml)}</td><td>${fmtMl(detail.bucket_capacity_ml)}</td>
+      </tr>`).join("") + "</tbody></table></div>";
+  }
+  html += `<p class="item-meta">未生成任何部分方案，请调整后重新计算。</p></div></div>`;
+  host.innerHTML = html;
+}
+
+function renderBucketPlan(plan) {
+  const host = $("#bucketResult");
+  const cap = plan.bucket_capacity_ml;
+  const bucketCards = plan.buckets.map((b) => {
+    const pct = Math.round((b.utilization || 0) * 100);
+    const members = b.streams.map((s) => `
+      <li class="bucket-member">
+        <span class="bucket-member-name">${escapeHtml(s.name)}</span>
+        <span class="item-meta">${fmtMl(s.volume_ml)} mL</span>
+        <span>${s.categories.map((c) => `<span class="badge badge-low">${escapeHtml(catLabel(c))}</span>`).join(" ")}</span>
+      </li>`).join("");
+    return `
+      <div class="bucket-card">
+        <div class="bucket-head">
+          <b>桶 ${b.index + 1}</b>
+          <span class="item-meta">负载 ${fmtMl(b.load_ml)} / ${fmtMl(cap)} mL（${pct}%）· 余量 ${fmtMl(b.spare_ml)} mL</span>
+        </div>
+        <div class="bucket-loadbar"><i style="width:${pct}%"></i></div>
+        <ul class="bucket-members">${members}</ul>
+      </div>`;
+  }).join("");
+
+  const seps = plan.separations || [];
+  const sepHtml = seps.length
+    ? `<div class="finding-list">${seps.map((sep, i) => `
+        <div class="finding-card high bucket-sep" data-sep="${i}">
+          <div class="fc-title">⛔ ${escapeHtml(sep.reagent_a)} × ${escapeHtml(sep.reagent_b)}
+            <span class="item-meta">已分入 桶 ${sep.bucket_a + 1} / 桶 ${sep.bucket_b + 1}</span></div>
+          <div class="fc-meta">${sep.rules.map((r) =>
+            `<span class="badge badge-high">[${escapeHtml(r.rule_id)}] ${escapeHtml(r.title)}</span>`).join(" ")}</div>
+          <div class="fc-meta">点击查看促使分隔的规则依据</div>
+        </div>`).join("")}</div>`
+    : '<p class="hint">废液之间没有命中严重（high）规则的分隔约束，仅受单桶容量限制。</p>';
+
+  host.innerHTML = `
+    <div class="report-banner safe">
+      <span class="big">🛢️</span>
+      <div style="flex:1">
+        <h2>最少 ${plan.bucket_count} 桶 · 最大桶负载 ${fmtMl(plan.max_bucket_load_ml)} mL</h2>
+        <p class="item-meta">共 ${plan.stream_count} 股废液 / 总体积 ${fmtMl(plan.total_volume_ml)} mL ·
+          单桶容量 ${fmtMl(cap)} mL · 全局限定规则图 ${escapeHtml(plan.rule_revision || "-")}（仅 high 规则促使分隔）· 预览不落库</p>
+        <p class="item-meta">优化口径：桶数最少 → 最大桶负载最小 → 桶内试剂名称序列字典序（结果稳定可复现）</p>
+      </div>
+    </div>
+    <div class="bucket-grid">${bucketCards}</div>
+    <div class="card" style="margin-top:14px">
+      <div class="card-head"><h2>⛔ 促使两股分隔的规则依据（${seps.length} 对）</h2></div>
+      ${sepHtml}
+    </div>`;
+
+  $$(".bucket-sep", host).forEach((el) => {
+    el.addEventListener("click", () => openBucketSepModal(plan.separations[Number(el.dataset.sep)], plan));
+  });
+}
+
+function openBucketSepModal(sep, plan) {
+  const dirLabel = (r) => r.match_direction === "a->b"
+    ? `${escapeHtml(sep.reagent_a)}（${escapeHtml(catLabel(r.category_a))}）→ ${escapeHtml(sep.reagent_b)}（${escapeHtml(catLabel(r.category_b))}）`
+    : `${escapeHtml(sep.reagent_b)}（${escapeHtml(catLabel(r.category_b))}）→ ${escapeHtml(sep.reagent_a)}（${escapeHtml(catLabel(r.category_a))}）`;
+  openModal(`
+    <button class="btn btn-ghost modal-close">✕ 关闭</button>
+    <h3>⛔ ${escapeHtml(sep.reagent_a)} × ${escapeHtml(sep.reagent_b)} 不可同桶</h3>
+    <p class="hint">两股废液在任一方向命中 high 规则，已分入 桶 ${sep.bucket_a + 1} 与 桶 ${sep.bucket_b + 1}；
+      规则图版本 ${escapeHtml(plan.rule_revision || state.revision || "-")}。</p>
+    ${sep.rules.map((r) => `
+      <div class="finding-card high" style="cursor:default">
+        <div class="fc-title"><span class="badge badge-high">${r.severity_label || "严重"}</span>
+          [${escapeHtml(r.rule_id)}] ${escapeHtml(r.title)}
+          ${r.rule_directional ? '<span class="badge badge-blocked">有向</span>' : '<span class="badge badge-blocked">无向</span>'}</div>
+        <div class="fc-meta">命中方向：${dirLabel(r)}</div>
+        <div class="m-row"><div class="m-k">反应 / 现象</div><div class="m-eq">${escapeHtml(r.reaction)}</div></div>
+        <div class="m-row"><div class="m-k">判定依据（机理）</div><div>${escapeHtml(r.rationale).replace(/\n/g, "<br>")}</div></div>
+        <div class="m-row"><div class="m-k">参考文献</div>
+          <ul class="m-refs">${(r.references || []).map((x) => `<li>· ${escapeHtml(x)}</li>`).join("") || "<li>无</li>"}</ul></div>
+      </div>`).join("")}
+  `);
+  $("#modalBox").classList.add("modal-wide");
+}
+
 /* ---------------- 工具 ---------------- */
 
 function escapeHtml(s) {
@@ -2257,8 +2488,10 @@ function fmtTime(iso) {
 
 (async function init() {
   state.stepRows = [makeStepRow()];
+  bucketState.streams = [makeBucketStream()];
   renderStepRows();
   renderCategoryChips();
+  renderBucketStreams();
   try {
     await Promise.all([loadReagents(), loadPlans(), loadRules()]);
   } catch (err) {

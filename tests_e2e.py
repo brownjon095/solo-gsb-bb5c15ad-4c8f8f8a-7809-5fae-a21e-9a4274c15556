@@ -661,5 +661,149 @@ check("序号重复标出全部相关行", rows == {2, 3}, e["detail"]["errors"]
 
 call("DELETE", f"/api/plans/{impid}")
 
+# ---------- 12. 废液分桶规划（预览不落库 / 最少桶 / 负载与名称序决胜 / 超容量拒绝） ----------
+print("【场景12】废液分桶规划")
+s, reagents = call("GET", "/api/reagents")
+by_name = {x["name"]: x for x in reagents}
+kcn, hcl = by_name["氰化钾"], by_name["盐酸"]
+nacl, naoh = by_name["氯化钠"], by_name["氢氧化钠溶液"]
+ethanol, ammonia = by_name["无水乙醇"], by_name["氨水"]
+s, plans_before = call("GET", "/api/plans")
+s, runs_before = call("GET", "/api/runs")
+n_plans, n_runs = len(plans_before), len(runs_before)
+
+# 12.1 high 规则促使分隔：氰化钾 × 盐酸（R001）不可同桶，氯化钠可与任一方同桶
+s, r = call("POST", "/api/bucketing/preview", {
+    "bucket_capacity_ml": 250,
+    "streams": [
+        {"reagent_id": kcn["id"], "volume_ml": 100},
+        {"reagent_id": hcl["id"], "volume_ml": 100},
+        {"reagent_id": nacl["id"], "volume_ml": 100},
+    ],
+})
+check("分桶预览 200", s == 200, (s, r))
+check("最少 2 桶", r["bucket_count"] == 2, r.get("bucket_count"))
+check("最大桶负载 200", r["max_bucket_load_ml"] == 200, r.get("max_bucket_load_ml"))
+check("使用全局限定规则图", r["rule_scope"] == "global" and r["rule_revision"], r.get("rule_scope"))
+bnames = {b["index"]: sorted(x["name"] for x in b["streams"]) for b in r["buckets"]}
+bucket_sets = {frozenset(v) for v in bnames.values()}
+check("氰化钾与盐酸分入不同桶", bucket_sets == {frozenset({"氰化钾", "氯化钠"}), frozenset({"盐酸"})},
+      bnames)
+pair = {(x["reagent_a"], x["reagent_b"]) for x in r["separations"]}
+check("分隔依据列出 氰化钾×盐酸", ("氰化钾", "盐酸") in pair, r["separations"])
+sep = next(x for x in r["separations"] if x["reagent_a"] == "氰化钾")
+check("分隔依据含 R001 与反应/机理/文献", sep["rules"][0]["rule_id"] == "R001"
+      and "HCN" in sep["rules"][0]["reaction"] and len(sep["rules"][0]["rationale"]) > 20
+      and sep["rules"][0]["references"], sep)
+check("分隔对落在不同桶", sep["bucket_a"] != sep["bucket_b"], sep)
+loads = {b["index"]: b["load_ml"] for b in r["buckets"]}
+check("每桶负载不超容量且总和=总体积",
+      all(v <= 250 for v in loads.values()) and abs(sum(loads.values()) - 300) < 1e-6, loads)
+
+# 12.2 稳定性：同一请求两次结果完全一致
+s, r2 = call("POST", "/api/bucketing/preview", {
+    "bucket_capacity_ml": 250,
+    "streams": [
+        {"reagent_id": kcn["id"], "volume_ml": 100},
+        {"reagent_id": hcl["id"], "volume_ml": 100},
+        {"reagent_id": nacl["id"], "volume_ml": 100},
+    ],
+})
+check("相同输入结果稳定一致", r2 == r, "两次响应不一致")
+
+# 12.3 最大桶负载决胜：4 股无冲突废液 100/90/80/70，容量 200 → {100,70} & {90,80}
+s, r = call("POST", "/api/bucketing/preview", {
+    "bucket_capacity_ml": 200,
+    "streams": [
+        {"reagent_id": ammonia["id"], "volume_ml": 100},
+        {"reagent_id": ethanol["id"], "volume_ml": 90},
+        {"reagent_id": naoh["id"], "volume_ml": 80},
+        {"reagent_id": nacl["id"], "volume_ml": 70},
+    ],
+})
+check("无冲突时桶数按下界取 2", s == 200 and r["bucket_count"] == 2, (s, r.get("bucket_count")))
+check("最大桶负载取最小 170（而非 190/180）", r["max_bucket_load_ml"] == 170,
+      r.get("max_bucket_load_ml"))
+groups = {frozenset(x["name"] for x in b["streams"]) for b in r["buckets"]}
+check("均衡分组 {氨水,氯化钠} & {无水乙醇,氢氧化钠溶液}",
+      groups == {frozenset({"氨水", "氯化钠"}), frozenset({"无水乙醇", "氢氧化钠溶液"})}, groups)
+check("无 high 冲突时分隔依据为空", r["separations"] == [], r["separations"])
+
+# 12.4 medium 规则不促使分隔：盐酸 × 氢氧化钠（R014 警示）可同桶
+s, r = call("POST", "/api/bucketing/preview", {
+    "bucket_capacity_ml": 200,
+    "streams": [
+        {"reagent_id": hcl["id"], "volume_ml": 100},
+        {"reagent_id": naoh["id"], "volume_ml": 100},
+    ],
+})
+check("medium 规则不分桶（1 桶装下）", s == 200 and r["bucket_count"] == 1
+      and r["separations"] == [], (s, r.get("bucket_count")))
+
+# 12.5 有向 high 规则：任一方向命中都促使分隔
+s, rg1 = call("POST", "/api/reagents", {"name": "测试废液-甲", "categories": ["cat_bx"]})
+s, rg2 = call("POST", "/api/reagents", {"name": "测试废液-乙", "categories": ["cat_by"]})
+s, _ = call("POST", "/api/rules", {
+    "id": "C900", "source": "cat_bx", "target": "cat_by",
+    "directional": True, "severity": "high", "title": "有向分隔测试",
+    "reaction": "X + Y -> 危险", "rationale": "任一方向混合均危险。", "references": ["T1"],
+})
+check("创建有向 high 规则", s == 201, s)
+s, r = call("POST", "/api/bucketing/preview", {
+    "bucket_capacity_ml": 1000,
+    "streams": [
+        {"reagent_id": rg2["id"], "volume_ml": 10},   # 乙(cat_by) 在前：反向也命中
+        {"reagent_id": rg1["id"], "volume_ml": 10},   # 甲(cat_x)
+    ],
+})
+check("有向规则任一方向命中即分隔", s == 200 and r["bucket_count"] == 2
+      and len(r["separations"]) == 1
+      and r["separations"][0]["rules"][0]["rule_id"] == "C900"
+      and r["separations"][0]["rules"][0]["rule_directional"] is True, (s, r.get("separations")))
+
+# 12.6 单股超容量：明确原因、不生成部分方案
+s, e = call("POST", "/api/bucketing/preview", {
+    "bucket_capacity_ml": 250,
+    "streams": [
+        {"reagent_id": hcl["id"], "volume_ml": 300},
+        {"reagent_id": nacl["id"], "volume_ml": 100},
+    ],
+})
+check("单股超容量 422", s == 422, (s, e))
+detail = e.get("detail", {})
+check("原因指明超容量废液与容量", "超过单桶容量" in detail.get("message", "")
+      and detail.get("over_capacity_streams", [{}])[0].get("name") == "盐酸"
+      and detail.get("bucket_capacity_ml") == 250, detail)
+check("不生成部分方案", "buckets" not in e and "bucket_count" not in e, list(e))
+
+# 12.7 请求校验：超过 12 股 / 体积非法 / 未知试剂
+many = [{"reagent_id": nacl["id"], "volume_ml": 10} for _ in range(13)]
+s, e = call("POST", "/api/bucketing/preview", {"bucket_capacity_ml": 1000, "streams": many})
+check("超过 12 股 422", s == 422, s)
+s, e = call("POST", "/api/bucketing/preview", {
+    "bucket_capacity_ml": 1000,
+    "streams": [{"reagent_id": nacl["id"], "volume_ml": 0}],
+})
+check("体积必须为正 422", s == 422, s)
+s, e = call("POST", "/api/bucketing/preview", {
+    "bucket_capacity_ml": 1000,
+    "streams": [{"reagent_id": 999999, "volume_ml": 10}],
+})
+check("未知试剂 422 且列明", s == 422 and 999999 in e.get("detail", {}).get("unknown_reagent_ids", []),
+      (s, e))
+s, e = call("POST", "/api/bucketing/preview", {"bucket_capacity_ml": 0,
+            "streams": [{"reagent_id": nacl["id"], "volume_ml": 10}]})
+check("容量必须为正 422", s == 422, s)
+
+# 12.8 预览不落库：方案数 / 推演记录数均不变
+s, plans_after = call("GET", "/api/plans")
+s, runs_after = call("GET", "/api/runs")
+check("预览不产生方案与推演记录", len(plans_after) == n_plans and len(runs_after) == n_runs,
+      (len(plans_after), n_plans, len(runs_after), n_runs))
+
+call("DELETE", f"/api/rules/C900")
+call("DELETE", f"/api/reagents/{rg1['id']}")
+call("DELETE", f"/api/reagents/{rg2['id']}")
+
 print(f"\n结果：{PASS} 通过，{FAIL} 失败")
 sys.exit(1 if FAIL else 0)

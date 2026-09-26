@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import WEB_DIR
 from .database import SessionLocal, init_db
-from .routers import imports, plans, reagents, rule_versions, rules, runs
+from .routers import bucketing, imports, plans, reagents, rule_versions, rules, runs
 from .rules_store import sync_builtin_rules
 from .seed import seed_data
 
@@ -28,7 +28,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="实验室配液相容性推演台",
     description="录入试剂属性与按时间排列的加液步骤，基于可维护规则图逐步推演相容性。",
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -39,6 +39,7 @@ app.include_router(plans.router)
 app.include_router(rule_versions.router)
 app.include_router(rules.router)
 app.include_router(runs.router)
+app.include_router(bucketing.router)
 
 
 @app.get("/api/health", tags=["meta"])
